@@ -1,0 +1,616 @@
+library(tidyverse)
+library(FSA)
+library(brms)
+library(tidybayes)
+library(dataRetrieval)
+
+#### Load data
+df <- read.csv("Blue_Sucker_data.csv", na.strings=c("","NA"))
+df <- droplevels(filter(df, !is.na(Length)))
+
+#######Discharge Daily Values######
+siteNo <- "06478500"  #Scotland gage, James River, SD
+pCode <- "00060"
+start.date <- "1983-04-01"
+end.date <- "2010-6-30"
+
+dischargedv <- readNWISdv(siteNumbers = siteNo,
+                          parameterCd = pCode,
+                          startDate = start.date,
+                          endDate = end.date)
+dischargedv<-renameNWISColumns(dischargedv)
+
+dischargedv$year = as.numeric(format(dischargedv$Date, format = "%Y"))
+dischargedv$month = as.numeric(format(dischargedv$Date, format = "%m"))
+
+River_data<-filter(dischargedv, month>3&month<7)
+#Mean annual April-June discharge
+Annual_River_data <- River_data %>% group_by(year) %>% 
+  summarize(Mean_Disch = mean(Flow), Median_Disch=median(Flow)) %>% 
+  rename(Year=year) %>% 
+  mutate(Mean_cms = Mean_Disch*0.028316832, Median_cms = Median_Disch*0.028316832)
+
+print(Annual_River_data,n=28)#%>% ggplot(aes(x=year, y=Median_Disch))+geom_line()
+##############################################################################################################
+#################################  Sex-Specific Length - Weight Regression  ##################################
+##############################################################################################################
+LW<-df %>% 
+  rename(Sex=`Sex..lab.`) %>% 
+  mutate(Sex.key = ifelse(is.na(Sex..Field.), "I", ifelse(Sex=="M", "M", "F")))
+
+###Plot Raw Data
+LW %>% filter(Sex=="M" | Sex=="F"| is.na(Sex..Field.)) %>% 
+  ggplot(aes(log10(Length),log10(Weight)))+
+  geom_point(aes(color=Sex))
+
+#
+LW_F <- LW %>% filter(Sex!="M" | is.na(Sex..Field.)) %>% mutate(Log_Length=log10(Length))
+LW_M <- LW %>% filter(Sex!="F"| is.na(Sex..Field.)) %>% mutate(Log_Length=log10(Length))
+################Prior Simulations Females####################
+priors <- tibble(a = rnorm(100,-6, 1.5),
+                 b = rnorm(100, 3, 1),
+                 sigma = rexp(100, 0.1),
+                 sim = 1:100)
+
+# data (only the x values, since we're simulating y and mu and pretending we don't have them yet)
+x <- LW_F$Log_Length
+
+# combine and simulate
+prior_and_x <- priors %>% expand_grid(x = x) %>%    # combine priors and x's
+  mutate(mu = a + b*x,                              # create new column call it mu- simulate regressions
+         y = rnorm(nrow(.), mu, sigma))             # new column called y simulate data (e.g., y_rep)
+
+# plot
+prior_and_x %>% 
+  ggplot(aes(x = x, y = mu, group = sim)) + 
+  geom_line() +
+  geom_point(data=LW_F,aes(y = log10(Weight), x=Log_Length, group=NA)) +
+  labs(y = "sim")
+
+################Prior Simulations Males####################
+priors <- tibble(a = rnorm(100,-6, 1.5),
+                 b = rnorm(100, 3, 1),
+                 sigma = rexp(100, 0.1),
+                 sim = 1:100)
+
+# data (only the x values, since we're simulating y and mu and pretending we don't have them yet)
+x <- LW_M$Log_Length
+
+# combine and simulate
+prior_and_x <- priors %>% expand_grid(x = x) %>%    # combine priors and x's
+  mutate(mu = a + b*x,                              # create new column call it mu- simulate regressions
+         y = rnorm(nrow(.), mu, sigma))             # new column called y simulate data (e.g., y_rep)
+
+# plot
+prior_and_x %>% 
+  ggplot(aes(x = x, y = mu, group = sim)) + 
+  geom_line() +
+  geom_point(data=LW_M,aes(y = log10(Weight), x=Log_Length, group=NA)) +
+  labs(y = "sim")
+################ Model ################
+get_prior(log(Weight) ~ log(Length),  
+          data = LW_F, family = gaussian(),
+          iter=2000,chains=4,cores=4)
+
+#Females
+lw_f<-brm(log10(Weight) ~ Log_Length,family = gaussian(),  
+          data = LW_F %>% filter(Sex=="F"), 
+          prior = c(prior(normal(-6, 1.5), class = "Intercept"),
+                    prior(normal(3, 1), class = "b"),
+                    prior(exponential(0.1),class="sigma")),
+          file = "lw_f.rds",
+          iter=2000,chains=4,cores=4)
+
+summary(lw_f)
+plot(lw_f)
+pp_check((lw_f))
+plot(conditional_effects(lw_f), points = TRUE)
+bayes_R2(lw_f)
+
+#Males
+lw_m<-brm(log10(Weight) ~ Log_Length,family = gaussian(),  
+          data = LW_M, 
+          prior = c(prior(normal(-6, 1.5), class = "Intercept"),
+                       prior(normal(3, 1), class = "b"),
+                       prior(exponential(0.1),class="sigma")),
+          file = "lw_m.rds",
+          iter=2000,chains=4,cores=4)
+
+summary(lw_m)
+plot(lw_m)
+pp_check((lw_m))
+plot(conditional_effects(lw_m), points = TRUE)
+bayes_R2(lw_m)
+############### PLOT ############
+post_predsM <- tibble(Log_Length = seq(2.4,3,0.01)) %>% 
+  add_epred_draws(lw_m, re_formula = NULL) %>% 
+  mean_qi(.epred); post_predsM  
+post_predsF <- tibble(Log_Length = seq(2.4,3,0.01)) %>% 
+  add_epred_draws(lw_f, re_formula = NULL) %>% 
+  mean_qi(.epred); post_predsF  
+  
+ggplot() + 
+  geom_line(data=post_predsM,color="gray60",aes(x=Log_Length,y=.epred))+
+  geom_line(data=post_predsF,aes(x=Log_Length,y=.epred), linetype=2)+
+  geom_point(data=filter(LW, Sex=="M"|Sex=="F"|is.na(Sex..Field.)), 
+             aes(y=log10(Weight), x=log10(Length), fill=Sex.key, shape=Sex.key),
+             alpha=0.3)+
+  ylab(expression(Log[10]~total~weight~(g)))+
+  xlab(expression(Log[10]~total~length~(mm)))+
+  scale_fill_manual(breaks=c('F', "M", "I"), values=c("black", "gray60", "gray80"), name = "Sex")+
+  scale_shape_manual(breaks=c('F', "M", "I"), values=c(21,22,24), name = "Sex")+
+  theme_classic()+
+  xlim(2.5,3)+
+  theme(panel.background = element_rect(fill=NA),
+        axis.title=element_text(size=18),
+        axis.text = element_text(size = 12), 
+        legend.position = c(.95, 0.5),
+        legend.justification = c("right", "top"),
+        legend.box.just = "right",
+        legend.box.background = element_rect(color="black", size=1),
+        legend.text = element_text(size=12),
+        legend.title = element_text(size = 12),)
+
+#ggsave("Figure3.LW_regression.jpeg", height=4.5, width=5, units="in", dpi=800)
+
+###### Sensitivity Analysis ######
+#Females
+lw_f_sens<-brm(log10(Weight) ~ Log_Length,family = gaussian(),  
+          data = LW_F, 
+          prior = c(prior(normal(-6, 3), class = "Intercept"),
+                    prior(normal(3, 2), class = "b"),
+                    prior(exponential(0.05),class="sigma")),
+          file = "lw_f_sens.rds",
+          iter=2000,chains=4,cores=4)
+
+#compare to original model (percent difference in parameter estimates)
+summary(lw_f_sens)
+(posterior_summary(lw_f_sens)[1]-posterior_summary(lw_f)[1])/posterior_summary(lw_f)[1]*100 #mean intercept
+(posterior_summary(lw_f_sens)[2]-posterior_summary(lw_f)[2])/posterior_summary(lw_f)[2]*100 #mean slope
+(posterior_summary(lw_f_sens)[3]-posterior_summary(lw_f)[3])/posterior_summary(lw_f)[3]*100 #mean sigma
+
+#Males
+lw_m_sens<-brm(log10(Weight) ~ log10(Length),family = gaussian(),  
+          data = LW_M, 
+          prior = c(prior(normal(-6, 3), class = "Intercept"),
+                    prior(normal(3, 2), class = "b"),
+                    prior(exponential(0.05),class="sigma")),
+          file = "lw_m_sens.rds",
+          iter=2000,chains=4,cores=4)
+
+#compare to original model (percent difference in parameter estimates)
+summary(lw_m_sens)
+(posterior_summary(lw_m_sens)[1]-posterior_summary(lw_m)[1])/posterior_summary(lw_m)[1]*100 #mean intercept
+(posterior_summary(lw_m_sens)[2]-posterior_summary(lw_m)[2])/posterior_summary(lw_m)[2]*100 #mean slope
+(posterior_summary(lw_m_sens)[3]-posterior_summary(lw_m)[3])/posterior_summary(lw_m)[3]*100 #mean sigma
+
+##############################################################################################################
+####################################   Otolith to Fin Ray Age comparison   ###################################
+##############################################################################################################
+Otolith <- df %>% 
+  rename(Age=`Concensus.Age`,
+         O_weight="Otolith.Weight..mg.",
+         FR_Age="Fin.Concensus.Age") %>% 
+  drop_na(`O_weight`,`Age`)
+
+#plot
+ggplot() + 
+  geom_point(data=Otolith, aes(x = Age, y = FR_Age), alpha=0.3)+
+  geom_line(aes(x=seq(0,61, 1), y=seq(0,61,1)))+
+  ylab("Otolith age (years)")+
+  xlab("Otolith age (years)")+
+  scale_fill_manual(values=c("black","grey60"))+
+  scale_color_manual(values=c("black","grey60"))+
+  ylim(0,61)+
+  theme_classic()+
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=20,hjust = 0.5),
+        panel.background = element_rect(fill=NA),
+        axis.title=element_text(size=18),
+        axis.text = element_text(size = 12))
+
+#ggsave("Figure4.Otolith_to_fin_ray_age.jpeg", height=4.5, width=5, units="in", dpi=800)
+##############################################################################################################
+####################################   Otolith Weight to Age comparison   ####################################
+##############################################################################################################
+##########Plot Data##############
+Otolith %>% ggplot(aes(O_weight,Age))+
+  geom_point()
+
+################Prior Simulations##################
+priors <- tibble(a = rnorm(100,0, 5),
+                 b = rnorm(100, 2, 5),
+                 sigma = rexp(100, 0.1),
+                 sim = 1:100)
+
+# data (only the x values, since we're simulating y and mu and pretending we don't have them yet)
+x <- Otolith$O_weight
+
+# combine and simulate
+prior_and_x <- priors %>% expand_grid(x = x) %>%    # combine priors and x's
+  mutate(mu = a + b*x,                              # create new column call it mu- simulate regressions
+         y = rnorm(nrow(.), mu, sigma))             # new column called y simulate data (e.g., y_rep)
+
+# plot
+prior_and_x %>% 
+  ggplot(aes(x = x, y = mu, group = sim)) + 
+  geom_line() +
+  geom_point(data=Otolith,aes(y = Age, x=O_weight, group=NA)) +
+  labs(y = "sim")
+################ Otolith Weight to Age Models ################
+weight_age<-brm(Age ~ O_weight,
+                family = gaussian(),  
+                data = Otolith, 
+                prior = c(prior(normal(0, 5), class = "Intercept"),
+                          prior(normal(2, 5), class = "b"),
+                          prior(exponential(0.1),class="sigma")),
+                file="weight_age.rds",
+                iter=2000,chains=4,cores=4)
+
+summary(weight_age)
+plot(weight_age)
+pp_check((weight_age))
+plot(conditional_effects(weight_age), points = TRUE)
+bayes_R2(weight_age)
+########## Sensitivity Analysis ##########
+weight_age_sens<-brm(Age ~ O_weight,family = gaussian(),  
+                     data = Otolith, 
+                     prior = c(prior(normal(0, 10), class = "Intercept"),
+                               prior(normal(2, 10), class = "b"),
+                               prior(exponential(0.05),class="sigma")),
+                     file="weight_age_sens.rds",
+                     iter=2000,chains=4,cores=4)
+
+#compare to original model (percent difference in parameter estimates)
+summary(weight_age_sens)
+(posterior_summary(weight_age_sens)[1]-posterior_summary(weight_age)[1])/posterior_summary(weight_age)[1]*100 #mean intercept
+(posterior_summary(weight_age_sens)[2]-posterior_summary(weight_age)[2])/posterior_summary(weight_age)[2]*100 #mean slope
+(posterior_summary(weight_age_sens)[3]-posterior_summary(weight_age)[3])/posterior_summary(weight_age)[3]*100 #mean sigma
+
+plot(conditional_effects(weight_age_sens), points=T)
+
+############# Posterior #################
+#predict medians
+post_preds <- tibble(O_weight = seq(0, 20)) %>% 
+  add_epred_draws(weight_age, re_formula = NULL) %>% mean_qi(.epred)
+
+post_preds2 <- tibble(O_weight = seq(0, 20)) %>% 
+  add_predicted_draws(weight_age, re_formula = NULL) %>% mean_qi(.prediction)
+
+#plot
+post_preds %>% ggplot(aes(x = O_weight, y = .epred)) + 
+  geom_line() +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper),
+              alpha = 0.2) +
+  #geom_ribbon(data=post_preds2,aes(y=.prediction, ymin = .lower, ymax = .upper),alpha = 0.2) +    #Adds 95% Prediction Interval shading. Can change interval width in post_preds2 line of code
+  geom_point(data=Otolith, aes(y=Age, x=O_weight),alpha=0.5)+
+  ylab("Otolith age (years)")+
+  xlab("Otolith weight (mg)")+
+  scale_fill_manual(values=c("black","grey60"))+
+  scale_color_manual(values=c("black","grey60"))+
+  theme_classic()+
+  theme(panel.grid = element_blank(),
+        plot.title = element_text(size=20,hjust = 0.5),
+        panel.background = element_rect(fill=NA),
+        axis.title=element_text(size=18),
+        axis.text = element_text(size = 12))
+
+ggsave("Figure5.Otolith_weight_to_age.jpeg", height=4.5, width=5, units="in", dpi=800)
+
+##############################################################################################################
+####################################     Year-class Strength Analysis     ####################################
+##############################################################################################################
+All_Ages_final <- df %>% drop_na(Adjusted.2022.age)
+
+#visualize results
+hist(All_Ages_final$Adjusted.2022.age, breaks=seq(-1,61,by=1), ylim=c(0,40), col="dark gray")
+xtabs(~Adjusted.2022.age, data=All_Ages_final)
+
+################################
+#Bayesian Regression Model
+aged_summary <- All_Ages_final %>% 
+  group_by(Adjusted.2022.age) %>% 
+  summarize(count=length(Adjusted.2022.age)) %>% 
+  add_row(Adjusted.2022.age = c(18,31,32,33), count = rep(0,4)) %>% 
+  filter(Adjusted.2022.age>11&Adjusted.2022.age<40) %>% 
+  rename(Age = Adjusted.2022.age) %>% 
+  arrange(Age) %>% 
+  mutate(Year = 2022 - Age, 
+         count_adj = count+1,
+         logcount = log(count_adj)); aged_summary %>% print(n=40)
+
+ccbays <- full_join(aged_summary, Annual_River_data)
+  
+# simulate priors
+priors <- tibble(a = rnorm(100, 3, 1),
+                 b = rnorm(100, -0.05, 0.03),
+                 sigma = rexp(100, 1),
+                 sim = 1:100)
+
+# data (only the x values, since we're simulating y and mu and pretending we don't have them yet)
+x <- ccbays$Age
+
+# combine and simulate
+prior_and_x <- priors %>% expand_grid(x = x) %>%    # combine priors and x's
+  mutate(mu = a + b*x,                              # create new column call it mu- simulate regressions
+         y = rnorm(nrow(.), mu, sigma))             # new column called y simulate data (e.g., y_rep)
+
+# plot
+prior_and_x %>% 
+  ggplot(aes(x = x, y = mu, group = sim)) + 
+  geom_line() +
+  geom_point(data=ccbays,aes(y = logcount, x=Age, group=NA)) +
+  labs(y = "sim")
+
+
+# Unweighted regression of log(catch) ~ Age
+YCSmod <- brm(logcount ~ Age, 
+              data = ccbays,
+              family = gaussian(),
+              prior = c(prior(normal(3, 1.5), class = "Intercept"),
+                          prior(normal(-0.05, 0.05), class = "b"),
+                          prior(exponential(1), class = "sigma")), 
+              file = "YCSmod.rds",
+              iter=2000, chains=4,cores = 4)
+
+summary(YCSmod)
+plot(conditional_effects(YCSmod,re_formula=NULL), points = TRUE)
+pp_check(YCSmod,type="boxplot",notch=FALSE)
+
+
+#sensitivity
+YCSmod_sens <- brm(logcount ~ Age, 
+              data = ccbays,
+              family = gaussian(),
+              prior = c(prior(normal(3, 3), class = "Intercept"),
+                        prior(normal(-0.05, 0.1), class = "b"),
+                        prior(exponential(0.5), class = "sigma")), 
+              file = "YCSmod_sens.rds",
+              iter=2000, chains=4,cores = 4)
+
+#compare to original model (percent difference in parameter estimates)
+summary(YCSmod_sens)
+(posterior_summary(YCSmod_sens)[1]-posterior_summary(YCSmod)[1])/posterior_summary(YCSmod)[1]*100 #mean intercept
+(posterior_summary(YCSmod_sens)[2]-posterior_summary(YCSmod)[2])/posterior_summary(YCSmod)[2]*100 #mean slope
+(posterior_summary(YCSmod_sens)[3]-posterior_summary(YCSmod)[3])/posterior_summary(YCSmod)[3]*100 #mean sigma
+
+#### getting residuals #####
+post_res <- tibble(Age = seq(12, 39)) %>% 
+  add_epred_draws(YCSmod) %>% mean_qi(.epred)
+ccbays_weight <- right_join(ccbays, post_res %>% select(.epred, Age)) %>% 
+  rename(weight=.epred)
+
+########################
+#weighted residual model --> weighting the regression by the predicted log(catch) values from YCSmod
+#run weighted model
+YCSmod_weight <- brm(logcount | weights(weight) ~ Age, 
+              data = ccbays_weight,
+              family = gaussian(),
+              prior = c(prior(normal(3, 1.5), class = "Intercept"),
+                        prior(normal(-0.05, 0.05), class = "b"),
+                        prior(exponential(1), class = "sigma")), 
+              file = "YCSmod_weight.rds",
+              iter=2000, chains=4,cores = 4)
+
+summary(YCSmod_weight)
+plot(conditional_effects(YCSmod_weight,re_formula=NULL), points = TRUE)
+pp_check(YCSmod,type="boxplot",notch=FALSE)
+bayes_R2(YCSmod_weight)
+
+#sensitivity
+YCSmod_weight_sens <- brm(logcount | weights(weight) ~ Age, 
+                     data = ccbays_weight,
+                     family = gaussian(),
+                     prior = c(prior(normal(3, 1.5), class = "Intercept"),
+                               prior(normal(-0.05, 0.05), class = "b"),
+                               prior(exponential(1), class = "sigma")), 
+                     file = "YCSmod_weight_sens.rds",
+                     iter=2000, chains=4,cores = 4)
+
+#compare to original model (percent difference in parameter estimates)
+summary(YCSmod_weight_sens)
+(posterior_summary(YCSmod_weight_sens)[1]-posterior_summary(YCSmod_weight)[1])/posterior_summary(YCSmod_weight)[1]*100 #mean intercept
+(posterior_summary(YCSmod_weight_sens)[2]-posterior_summary(YCSmod_weight)[2])/posterior_summary(YCSmod_weight)[2]*100 #mean slope
+(posterior_summary(YCSmod_weight_sens)[3]-posterior_summary(YCSmod_weight)[3])/posterior_summary(YCSmod_weight)[3]*100 #mean sigma
+
+#summarize predicted log(catch) values across ages
+post_res_weight <- tibble(Age = seq(12, 39)) %>% 
+  add_epred_draws(YCSmod_weight) %>% median_qi(.epred)
+
+#calculate residuals from posterior sample
+post_res_weight2<-right_join(post_res_weight,ccbays_weight %>% select(Age, logcount, Median_cms),"Age") %>% 
+  mutate(residual = logcount-.epred)
+
+#plot
+post_res_weight2 %>% 
+  ggplot()+
+  geom_point(aes(x=log10(Median_cms), y=residual))+
+  theme_classic()
+
+###Year-class strength vs median May-June discharge
+YCS_Discharge <- brm(residual ~ log10(Median_cms), 
+                     data = post_res_weight2,
+                     family = gaussian(),
+                     prior = c(prior(normal(-1.5, 0.75), class = "Intercept"),
+                               prior(normal(1, 0.5), class = "b"),
+                               prior(exponential(0.1), class = "sigma")), 
+                     file = "YCS_Discharge.rds",
+                     iter=2000, chains=4,cores = 4)
+
+summary(YCS_Discharge)
+plot(YCS_Discharge)
+pp_check((YCS_Discharge))
+plot(conditional_effects(YCS_Discharge), points = TRUE)
+bayes_R2(YCS_Discharge)
+
+#sensitivity analysis
+YCS_Discharge_sens <- brm(residual ~ log10(Median_cms), 
+                     data = post_res_weight2,
+                     family = gaussian(),
+                     prior = c(prior(normal(-1.5, 1.5), class = "Intercept"),
+                               prior(normal(1, 1), class = "b"),
+                               prior(exponential(0.05), class = "sigma")), 
+                     file = "YCS_Discharge_sens.rds",
+                     iter=2000, chains=4,cores = 4)
+
+#compare to original model (percent difference in parameter estimates)
+summary(YCS_Discharge_sens)
+(posterior_summary(YCS_Discharge_sens)[1]-posterior_summary(YCS_Discharge)[1])/posterior_summary(YCS_Discharge)[1]*100 #mean intercept
+(posterior_summary(YCS_Discharge_sens)[2]-posterior_summary(YCS_Discharge)[2])/posterior_summary(YCS_Discharge)[2]*100 #mean slope
+(posterior_summary(YCS_Discharge_sens)[3]-posterior_summary(YCS_Discharge)[3])/posterior_summary(YCS_Discharge)[3]*100 #mean sigma
+
+#Predict residuals across discharge values
+post_disch <- tibble(Median_cms = seq(min(post_res_weight2$Median_cms),
+                                                     max(post_res_weight2$Median_cms),1)) %>% 
+  add_epred_draws(YCS_Discharge) %>% mean_qi(.epred)
+
+#Strong and weak year class cut-offs using Studentized t-distribution
+qt(c(.2, .8), df=length(post_res_weight2$Age)-1)
+
+#Final plot of Year-class strength (catch curve residuals) vs river discharge
+post_disch %>% 
+  ggplot()+
+  geom_line(aes(x=Median_cms, y=.epred))+
+  geom_ribbon(aes(y=.epred,ymin=.lower, ymax=.upper, x=Median_cms), alpha=0.2)+
+  geom_point(data=post_res_weight2, aes(x=Median_cms, y=residual), size=1)+
+  theme_classic()+
+  ylim(-2,2)+
+  geom_vline(xintercept = 45,linetype=2)+
+  #geom_hline(yintercept = 0.8551372, linetype=2)+
+  #geom_hline(yintercept = -0.8551372, linetype=2)+
+  labs(x="April-June discharge (cms)", y="Weighted catch-curve residuals")+
+  theme(axis.title=element_text(size=18),
+        axis.text = element_text(size = 12))
+
+#ggsave("Figure6.YCS_with_strong_weak_lines.jpeg", height=4.5, width=5, units="in", dpi=800)
+#ggsave("Figure6.YCS_with_cms_cutoff.jpeg", height=4.5, width=5, units="in", dpi=800)
+
+##############################################################################################################
+####################################     von Bertalanffy Growth Curve     ####################################
+##############################################################################################################
+names(df)
+Aging <- df %>%    
+  filter(!is.na(Concensus.Age))
+
+#Give all blank sex cells a value of "U" for "Unknown"
+Age_L<-Aging %>% 
+  select(Length, `Concensus.Age`,`Sex..lab.`)%>%
+  rename(Sex=`Sex..lab.`,Age=`Concensus.Age`) %>% 
+  replace_na(list(Sex="U"))
+
+Age_L %>% ggplot(aes(x=Age,y=Length))+
+  geom_point(aes(color=Sex))
+
+######################### Formula ################################
+form_1 <- bf(Length ~ Linf *(1- exp(-K*(Age-t0))), #Von B Equation
+             Linf ~ Sex, #Sex as a fixed effect
+             K ~ Sex,
+             t0 ~ Sex,
+             nl = TRUE)
+
+############prior Simulations############
+priors = tibble(Linf = abs(rnorm(100, 720, 15)),
+                K = abs(rnorm(100,0.15 ,0.1)),
+                t0 = rnorm(100, -1.7, .4),
+                iter = 1:100)
+
+prior_sims = priors %>% 
+  expand_grid(Age_L %>% distinct(Age) %>% 
+                bind_rows(tibble(Age = 0))) %>% 
+  mutate(length_sims = Linf *(1- exp(-K*(Age-t0))))
+
+
+ggplot() + 
+  geom_line(data=prior_sims, aes(x = Age, y = length_sims, group = iter))+
+  geom_point(data=Age_L,aes(x=Age, y=Length,color="red"))
+
+##################### Model ########################
+Age_L1 <- filter(Age_L, Sex =="M"|Sex=="F")
+
+BSRVonsexModel1 <- brm(form_1 ,
+                       data = Age_L1,
+                       prior = c(prior(normal(720, 15), nlpar = "Linf"),
+                                 prior(normal(-20, 20), nlpar = "Linf",coef="SexM"),
+                                 prior(normal(.15, 0.1), nlpar = "K",lb=0),
+                                 prior(normal(0, 0.2), nlpar = "K",coef="SexM"),
+                                 prior(normal(-2, 0.5), nlpar = "t0"),
+                                 prior(normal(0, 1), nlpar = "t0",coef="SexM"),
+                                 prior(exponential(0.1), class="sigma")),
+                       file = "BSRVonsexModel1.rds",
+                       family = gaussian(),
+                       iter=2000, chains = 4, cores=8)
+
+summary(BSRVonsexModel1)
+plot(conditional_effects(BSRVonsexModel1), points = TRUE)
+pp_check(BSRVonsexModel1,type="boxplot")
+
+### Sensitivity Analysis
+BSRVonsexModel2 <- brm(form_1 ,
+                       data = Age_L1,
+                       prior = c(prior(normal(720, 30), nlpar = "Linf"),
+                                 prior(normal(-20, 40), nlpar = "Linf",coef="SexM"),
+                                 prior(normal(.15, 0.2), nlpar = "K",lb=0),
+                                 prior(normal(0, 0.4), nlpar = "K",coef="SexM"),
+                                 prior(normal(-2, 1), nlpar = "t0"),
+                                 prior(normal(0, 2), nlpar = "t0",coef="SexM"),
+                                 prior(exponential(0.05), class="sigma")),
+                       file = "BSRVonsexModel2.rds",
+                       family = gaussian(),
+                       iter=2000, chains = 4, cores=4)
+
+summary(BSRVonsexModel2)
+(posterior_summary(BSRVonsexModel2)[1]-posterior_summary(BSRVonsexModel1)[1])/posterior_summary(BSRVonsexModel1)[1]*100 #Linf
+(posterior_summary(BSRVonsexModel2)[2]-posterior_summary(BSRVonsexModel1)[2])/posterior_summary(BSRVonsexModel1)[2]*100 #Linf male
+(posterior_summary(BSRVonsexModel2)[3]-posterior_summary(BSRVonsexModel1)[3])/posterior_summary(BSRVonsexModel1)[3]*100 #K
+(posterior_summary(BSRVonsexModel2)[4]-posterior_summary(BSRVonsexModel1)[4])/posterior_summary(BSRVonsexModel1)[4]*100 #K male
+(posterior_summary(BSRVonsexModel2)[5]-posterior_summary(BSRVonsexModel1)[5])/posterior_summary(BSRVonsexModel1)[5]*100 #t0
+(posterior_summary(BSRVonsexModel2)[6]-posterior_summary(BSRVonsexModel1)[6])/posterior_summary(BSRVonsexModel1)[6]*100 #t0 male
+(posterior_summary(BSRVonsexModel2)[7]-posterior_summary(BSRVonsexModel1)[7])/posterior_summary(BSRVonsexModel1)[7]*100 #mean sigma
+
+################# Posterior Sampling ###############################
+
+vonB_preds <- tibble(Age = seq(1, 62)) %>% 
+  expand_grid(Sex = c("M", "F")) %>% 
+  add_epred_draws(BSRVonsexModel1, re_formula = NULL)
+
+vonB_preds %>%
+  group_by(Age) %>% 
+  summarize(TL=mean(.epred),
+            SD=sd(.epred))
+
+vonB_preds2 <- tibble(Age = seq(1, 62)) %>% 
+  expand_grid(Sex = c("M", "F")) %>% 
+  add_epred_draws(BSRVonsexModel2, re_formula = NULL)
+
+vonB_preds2 %>%
+  group_by(Age) %>% 
+  summarize(TL=mean(.epred),
+            SD=sd(.epred))
+################# Plotting Posterior ################################3
+vonB_preds %>% 
+  group_by(Age, Sex) %>% 
+  median_qi(.epred) %>% 
+  ggplot(aes(x = Age, y = .epred)) + 
+   geom_point(data=Age_L1, aes(y=Length, x=Age, col=Sex), alpha=0.5)+
+   geom_point(data=Age_L %>% filter(Sex=="U"), aes(y=Length, x=Age),color="black",shape=21, size=2)+
+    ylab("Total length (mm)")+
+    xlab("Age (years)")+
+    scale_fill_manual(labels=c("Females","Males"),values=c("black","grey60"))+
+    scale_color_manual(labels=c("Females","Males"),values=c("black","grey60","black"))+
+    geom_line(aes(color = Sex)) +
+    geom_ribbon(aes(fill = Sex, ymin = .lower, ymax = .upper),
+                alpha = 0.3) +
+    theme_classic()+
+    theme(panel.grid = element_blank(),
+          plot.title = element_blank(),
+          panel.background = element_rect(fill=NA),
+          legend.position = c(.95, 0.5),
+          legend.justification = c("right", "top"),
+          legend.box.just = "right",
+          legend.box.background = element_rect(color="black", size=1),
+          legend.text = element_text(size=12),
+          legend.title = element_text(size = 12),
+          axis.title=element_text(size=18),
+          axis.text = element_text(size = 12))
+
+#ggsave("Figure7.VonB.jpeg", height=4.5, width=5, units="in", dpi=800)
